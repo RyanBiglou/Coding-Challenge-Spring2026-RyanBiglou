@@ -13,19 +13,27 @@ RingView: TypeAlias = tuple[memoryview, memoryview | None, int, bool]
 
 class SharedBuffer(shared_memory.SharedMemory):
     """
-    Applicant template.
+    A cross-process shared-memory ring buffer.
 
-    Replace every method body with your own implementation while preserving the
-    public API used by the official tests.
-
-    The intended contract is:
-    - one writer and one or more readers
-    - shared state visible across processes
-    - bounded storage with reusable space after readers advance
-    - reads and writes report how many bytes are actually available
+    Single writer, multiple independent readers. Bounded storage with
+    reusable space after readers advance.
     """
 
     _NO_READER = -1
+
+    # Header layout (int64 slots):
+    #   0: write_pos
+    #   1: buffer_size
+    #   2: num_readers
+    #   3-5: reserved
+    # readers:
+    #   6 + i*3:     reader[i] position
+    #   6 + i*3 + 1: reader[i] active flag
+    #   6 + i*3 + 2: reader[i] reserved
+
+    _GLOBAL_SLOTS = 6
+    _SLOTS_PER_READER = 3
+    _SLOT_BYTES = 8  # np.int64
 
     def __init__(
         self,
@@ -37,207 +45,246 @@ class SharedBuffer(shared_memory.SharedMemory):
         cache_align: bool = False,
         cache_size: int = 64,
     ):
-        """
-        Open or create the shared buffer.
+        #validation
+        if cache_align and (cache_size <= 0 or (cache_size & (cache_size - 1)) != 0):
+            raise ValueError(
+                f"cache_size must be a power of two when cache_align is True, got {cache_size}"
+            )
 
-        Expected behavior:
-        - validate constructor arguments
-        - allocate or attach to shared memory
-        - initialize any shared metadata needed to track writer and reader state
-        - set up local views/fields used by the rest of the methods
+        if reader != self._NO_READER and (reader < 0 or reader >= num_readers):
+            raise ValueError(
+                f"reader index {reader} out of range [0, {num_readers})"
+            )
 
-        Parameters:
-        - `name`: shared memory block name
-        - `create`: `True` for the creator/owner, `False` to attach to an existing block
-        - `size`: logical payload capacity in bytes
-        - `num_readers`: number of reader slots to support
-        - `reader`: reader index for this instance, or `_NO_READER` for the writer instance
-        - `cache_align` / `cache_size`: optional metadata-layout knobs; you may ignore
-          them internally as long as validation and behavior remain correct
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.__init__")
+        #compute sizes
+        num_header_slots = self._GLOBAL_SLOTS + num_readers * self._SLOTS_PER_READER
+        header_bytes = num_header_slots * self._SLOT_BYTES
+        total_size = header_bytes + size
+
+        #init shared memory
+        super().__init__(name=name, create=create, size=total_size)
+
+        #local fields
+        self.buffer_size = size
+        self.num_readers = num_readers
+        self.reader = reader
+        self._header_bytes = header_bytes
+        self._num_header_slots = num_header_slots
+
+        #shared header as int64 array
+        self.header = np.ndarray(
+            num_header_slots, dtype=np.int64, buffer=self.buf[:header_bytes]
+        )
+
+        #payload region
+        self._payload = self.buf[header_bytes : header_bytes + size]
+
+        #initialize header on creation
+        if create:
+            self.header[:] = 0
+            self.header[1] = size
+            self.header[2] = num_readers
+
+        #cache reader slot index
+        self._slot = (self._GLOBAL_SLOTS + reader * self._SLOTS_PER_READER) if reader != self._NO_READER else -1
+
+        #cache for writable amount
+        self._cached_writable = size
 
     def close(self) -> None:
-        """
-        Release local views and close this process's handle to the shared memory.
-
-        This should not destroy the buffer for other attached processes.
-        """
         try:
             super().close()
         except Exception:
             pass
 
     def __enter__(self) -> "SharedBuffer":
-        """
-        Enter the context manager.
-
-        Reader instances are expected to mark themselves active while inside the
-        context. Writer-only instances can simply return `self`.
-        """
+        if self.reader != self._NO_READER: #if not writer
+            self.set_reader_active(True)
         return self
 
     def __exit__(self, *_):
-        """
-        Exit the context manager.
-
-        Reader instances are expected to mark themselves inactive on exit, then
-        close local resources.
-        """
+        if self.reader != self._NO_READER: #if not writer
+            self.set_reader_active(False)
         self.close()
 
-    def calculate_pressure(self) -> int:
-        """
-        Return current writer pressure as an integer percentage.
+    def _reader_slot(self) -> int:
+        return self._GLOBAL_SLOTS + self.reader * self._SLOTS_PER_READER
 
-        Pressure is based on how much of the bounded storage is currently in use
-        relative to the slowest active reader.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.calculate_pressure")
+    def _assert_reader(self) -> None:
+        if self.reader == self._NO_READER: #if writer
+            raise RuntimeError("Operation not allowed on a writer-only instance")
 
     def int_to_pos(self, value: int) -> int:
-        """
-        Convert an absolute position counter into a position inside the bounded payload area.
-
-        If your design does not use modulo arithmetic internally, you may still
-        keep this helper as the mapping from logical positions to buffer offsets.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.int_to_pos")
+        return value % self.buffer_size #ring buffer wraparound
 
     def update_reader_pos(self, new_reader_pos: int) -> None:
-        """
-        Store this reader's absolute read position in shared state.
-
-        This must fail clearly when called on a writer-only instance.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.update_reader_pos")
+        self._assert_reader()
+        self.header[self._slot] = new_reader_pos
 
     def set_reader_active(self, active: bool) -> None:
-        """
-        Mark this reader as active or inactive in shared state.
-
-        Active readers apply backpressure. Inactive readers should not reduce
-        writer capacity.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.set_reader_active")
+        self._assert_reader()
+        self.header[self._slot + 1] = 1 if active else 0
 
     def is_reader_active(self) -> bool:
-        """
-        Return whether this reader is currently marked active.
-
-        This must fail clearly when called on a writer-only instance.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.is_reader_active")
+        self._assert_reader()
+        return bool(self.header[self._slot + 1])
 
     def update_write_pos(self, new_writer_pos: int) -> None:
-        """
-        Store the writer's absolute write position in shared state.
-
-        The write position is what makes newly written bytes visible to readers.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.update_write_pos")
+        self.header[0] = new_writer_pos
 
     def inc_writer_pos(self, inc_amount: int) -> None:
-        """
-        Advance the writer's absolute position by `inc_amount` bytes.
-
-        This is how a writer publishes bytes after copying them into the buffer.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.inc_writer_pos")
+        self.header[0] += inc_amount
 
     def inc_reader_pos(self, inc_amount: int) -> None:
-        """
-        Advance this reader's absolute position by `inc_amount` bytes.
-
-        This is how a reader consumes bytes after reading them.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.inc_reader_pos")
+        self._assert_reader()
+        self.header[self._slot] += inc_amount
 
     def get_write_pos(self) -> int:
-        """
-        Return the current absolute writer position.
-
-        Readers can use this to resynchronize or compute how much data is available.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.get_write_pos")
+        return int(self.header[0])
 
     def compute_max_amount_writable(self, force_rescan: bool = False) -> int:
-        """
-        Return how many bytes the writer can safely expose right now.
+        write_pos = int(self.header[0])
+        min_reader_pos = None
 
-        This should take active readers into account. `force_rescan=True` is used
-        by the tests to ensure externally updated reader positions are observed.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.compute_max_amount_writable")
+        for i in range(self.num_readers):
+            slot = self._GLOBAL_SLOTS + i * self._SLOTS_PER_READER
+            active = bool(self.header[slot + 1])
+            if active:
+                rpos = int(self.header[slot])
+                if min_reader_pos is None or rpos < min_reader_pos:
+                    min_reader_pos = rpos
+
+        if min_reader_pos is None:
+            self._cached_writable = self.buffer_size
+        else:
+            used = write_pos - min_reader_pos
+            self._cached_writable = self.buffer_size - used
+
+        return self._cached_writable
 
     def jump_to_writer(self) -> None:
-        """
-        Move this reader directly to the current writer position.
+        self._assert_reader()
+        self.header[self._slot] = self.header[0]
 
-        Use this when a reader has fallen too far behind and old unread data is
-        no longer retained.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.jump_to_writer")
+    def calculate_pressure(self) -> int:
+        write_pos = int(self.header[0])
+        min_reader_pos = None
+
+        for i in range(self.num_readers):
+            slot = self._GLOBAL_SLOTS + i * self._SLOTS_PER_READER
+            active = bool(self.header[slot + 1])
+            if active:
+                rpos = int(self.header[slot])
+                if min_reader_pos is None or rpos < min_reader_pos:
+                    min_reader_pos = rpos
+
+        if min_reader_pos is None:
+            return 0
+
+        used = write_pos - min_reader_pos
+        return int(used * 100 / self.buffer_size)
+
+    def _make_ring_view(self, start_pos: int, actual: int) -> RingView:
+        if actual == 0:
+            empty = memoryview(bytearray(0))
+            return (empty, None, 0, False)
+
+        phys_start = self.int_to_pos(start_pos)
+        end = phys_start + actual
+
+        #if the view does not wrap around the end of the buffer, return a single contiguous view
+        if end <= self.buffer_size:
+            mv1 = self._payload[phys_start:end]
+            return (mv1, None, actual, False)
+        #if the view wraps around, return two views for the two contiguous segments
+        else:
+            first_len = self.buffer_size - phys_start
+            mv1 = self._payload[phys_start:self.buffer_size]
+            mv2 = self._payload[0:actual - first_len]
+            return (mv1, mv2, actual, True)
 
     def expose_writer_mem_view(self, size: int) -> RingView:
-        """
-        Return a writable view tuple for up to `size` bytes.
-
-        The return shape is:
-        - `mv1`: first writable view
-        - `mv2`: optional second writable view if the exposed region is split
-        - `actual_size`: how many bytes are actually writable right now
-        - `split`: whether the writable region is split across two views
-
-        If less than `size` bytes are currently writable, clamp to the amount
-        available rather than raising.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.expose_writer_mem_view")
+        actual = min(size, self._cached_writable)
+        write_pos = int(self.header[0])
+        return self._make_ring_view(write_pos, actual)
 
     def expose_reader_mem_view(self, size: int) -> RingView:
-        """
-        Return a readable view tuple for up to `size` bytes.
+        self._assert_reader()
 
-        The shape matches `expose_writer_mem_view()`. If less than `size` bytes
-        are currently readable, clamp to the amount available rather than raising.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.expose_reader_mem_view")
+        write_pos = int(self.header[0])
+        reader_pos = int(self.header[self._slot])
+        available = write_pos - reader_pos
+
+        # Reader has fallen behind beyond retention — resync
+        if available > self.buffer_size:
+            self.header[self._slot] = write_pos
+            reader_pos = write_pos
+            available = 0
+
+        actual = min(size, available)
+        return self._make_ring_view(reader_pos, actual)
 
     def simple_write(self, writer_mem_view: RingView, src: object) -> None:
-        """
-        Copy bytes from `src` into the exposed writer view(s).
+        mv1, mv2, actual, split = writer_mem_view
+        if actual == 0:
+            return
 
-        If `src` is larger than the destination region, copy only the prefix that fits.
-        This helper should not publish data by itself; publishing happens when the
-        writer position is advanced.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.simple_write")
+        src_bytes = bytes(src)
+        copy_len = min(len(src_bytes), actual)
+
+        if not split or mv2 is None:
+            mv1[:copy_len] = src_bytes[:copy_len]
+        else:
+            first_len = len(mv1)
+            mv1[:first_len] = src_bytes[:first_len]
+            remaining = copy_len - first_len
+            if remaining > 0:
+                mv2[:remaining] = src_bytes[first_len:first_len + remaining]
 
     def simple_read(self, reader_mem_view: RingView, dst: object) -> None:
-        """
-        Copy bytes from the exposed reader view(s) into `dst`.
+        mv1, mv2, actual, split = reader_mem_view
+        if actual == 0:
+            return
 
-        If `dst` is smaller than the readable region, copy only the prefix that fits.
-        This helper should not consume data by itself; consumption happens when the
-        reader position is advanced.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.simple_read")
+        dst_view = memoryview(dst).cast("B")
+        copy_len = min(len(dst_view), actual)
+
+        if not split or mv2 is None:
+            dst_view[:copy_len] = mv1[:copy_len]
+        else:
+            first_len = min(len(mv1), copy_len)
+            dst_view[:first_len] = mv1[:first_len]
+            remaining = copy_len - first_len
+            if remaining > 0:
+                dst_view[first_len:first_len + remaining] = mv2[:remaining]
 
     def write_array(self, arr: np.ndarray) -> int:
-        """
-        Write a NumPy array's raw bytes into the shared buffer.
+        nbytes = arr.nbytes
+        writable = self.compute_max_amount_writable()
+        if writable < nbytes:
+            return 0
 
-        Return the number of bytes written. If the full array does not fit, the
-        contract used by the tests expects this method to return `0`.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.write_array")
+        view = self.expose_writer_mem_view(nbytes)
+        self.simple_write(view, memoryview(arr).cast("B"))
+        self.inc_writer_pos(nbytes)
+        return nbytes
 
     def read_array(self, nbytes: int, dtype: np.dtype) -> np.ndarray:
-        """
-        Read `nbytes` from the shared buffer and interpret them as `dtype`.
+        view = self.expose_reader_mem_view(nbytes)
+        if view[2] < nbytes:
+            return np.array([], dtype=dtype)
 
-        Return a NumPy array view/copy of the requested bytes when enough data is
-        available. If there are not enough readable bytes, return an empty array
-        with the requested dtype.
-        """
-        raise NotImplementedError("TODO: implement SharedBuffer.read_array")
+        dst = bytearray(nbytes)
+        self.simple_read(view, dst)
+        self.inc_reader_pos(nbytes)
+        return np.frombuffer(bytes(dst), dtype=dtype)
+
+
+def _release_views(*views: memoryview | None) -> None:
+    for v in views:
+        if v is None:
+            continue
+        try:
+            v.release()
+        except Exception:
+            pass
